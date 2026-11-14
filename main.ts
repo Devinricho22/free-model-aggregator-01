@@ -73,13 +73,13 @@ import {
   anthropicError,
   anthropicEventsFromOpenAI,
   anthropicModelList,
-  anthropicToOpenAI,
+  anthropicRequestToOpenAIChat,
   openAIError,
   openAIModelList,
-  openAIToAnthropic,
-  openAIToAnthropicRequest,
-  openAIToGemini,
-  geminiToOpenAI,
+  openAIResponseToAnthropicMessage,
+  openAIRequestToAnthropicMessages,
+  openAIRequestToGemini,
+  geminiResponseToOpenAIChat,
   openAIRequestInputTokens,
   openAIStreamWithFinalUsage,
   type ServedModel,
@@ -242,11 +242,11 @@ async function callProvider(route: Route, body: Json): Promise<Response> {
   if (wire === 'openai') return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(body) });
   if (wire === 'anthropic') {
     headers['anthropic-version'] = '2023-06-01';
-    const translated = openAIToAnthropicRequest(body, route.model.id);
+    const translated = openAIRequestToAnthropicMessages(body, route.model.id);
     translated.stream = false;
     return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(translated) });
   }
-  const translated = openAIToGemini(body);
+  const translated = openAIRequestToGemini(body);
   const url = `${base}/v1beta/models/${encodeURIComponent(route.model.id)}:generateContent`;
   return fetch(url, { method: 'POST', headers, body: JSON.stringify(translated) });
 }
@@ -282,7 +282,7 @@ async function providerAnswer(response: Response, route: Route): Promise<Json> {
   const parsed: unknown = await response.json().catch(() => ({}));
   const value = isRecord(parsed) ? parsed : {};
   if (route.probe.provider.wire === 'openai') return value;
-  if (route.probe.provider.wire === 'gemini') return geminiToOpenAI(value, route.model.id);
+  if (route.probe.provider.wire === 'gemini') return geminiResponseToOpenAIChat(value, route.model.id);
   const content = Array.isArray(value.content) ? value.content : [];
   const text = content.flatMap((part) => isRecord(part) && part.type === 'text' && typeof part.text === 'string' ? [part.text] : []).join('');
   const calls = content.flatMap((part) => isRecord(part) && part.type === 'tool_use' ? [{ id: part.id, type: 'function', function: { name: part.name, arguments: JSON.stringify(part.input ?? {}) } }] : []);
@@ -360,7 +360,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const candidates = candidatesFor(requirementsFor(body));
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidates[0].model.id;
-  const canonical = anthropicToOpenAI(body, '');
+  const canonical = anthropicRequestToOpenAIChat(body, '');
   const selected = await callWithFailover(candidates, canonical);
   if (selected === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'all legal free providers refused this request');
   const upstream = selected.response;
@@ -381,7 +381,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     res.end();
     return;
   }
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, requested));
+  sendJson(res, 200, openAIResponseToAnthropicMessage(isRecord(answer) ? answer : {}, requested));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {

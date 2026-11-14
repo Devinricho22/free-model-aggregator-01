@@ -113,13 +113,14 @@ export function stopReasonOf(finish: unknown): string {
   return 'end_turn';
 }
 
+// ---- Request mapping: Anthropic Messages -> OpenAI Chat Completions ----
 /**
- * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
+ * Translate an Anthropic Messages request to OpenAI Chat Completions, including system text,
  * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
  * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
  * output cap, temperature, top_p, stop sequences and streaming pass through.
  */
-export function anthropicToOpenAI(body: Json, model: string): Json {
+export function anthropicRequestToOpenAIChat(body: Json, model: string): Json {
   const messages: Json[] = [];
   const system = textOf(body.system);
   if (system !== '') messages.push({ role: 'system', content: system });
@@ -209,8 +210,12 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
-/** OpenAI Chat request translated to Anthropic Messages. */
-export function openAIToAnthropicRequest(body: Json, model: string): Json {
+/** Backward-compatible name retained for the entry's tests and consumers. */
+export const anthropicToOpenAI = anthropicRequestToOpenAIChat;
+
+// ---- Request mapping: OpenAI Chat Completions -> Anthropic Messages ----
+/** Translate an OpenAI Chat Completions request to Anthropic Messages. */
+export function openAIRequestToAnthropicMessages(body: Json, model: string): Json {
   const source = Array.isArray(body.messages) ? body.messages : [];
   let system: Json[] = [];
   const messages: Json[] = [];
@@ -246,8 +251,12 @@ export function openAIToAnthropicRequest(body: Json, model: string): Json {
   return out;
 }
 
-/** OpenAI Chat request translated to Gemini generateContent. */
-export function openAIToGemini(body: Json): Json {
+/** Backward-compatible name retained for the entry's tests and consumers. */
+export const openAIToAnthropicRequest = openAIRequestToAnthropicMessages;
+
+// ---- Request mapping: OpenAI Chat Completions -> Gemini generateContent ----
+/** Translate an OpenAI Chat Completions request to Gemini generateContent. */
+export function openAIRequestToGemini(body: Json): Json {
   const contents: Json[] = [];
   let system = '';
   for (const raw of Array.isArray(body.messages) ? body.messages : []) {
@@ -294,6 +303,10 @@ export function openAIToGemini(body: Json): Json {
   return out;
 }
 
+/** Backward-compatible name retained for the entry's tests and consumers. */
+export const openAIToGemini = openAIRequestToGemini;
+
+// ---- Deterministic stream input accounting ----
 /** The simulator's deterministic token accounting for a Chat Completions request. */
 export function openAIRequestInputTokens(body: Json): number {
   const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -313,8 +326,8 @@ export function openAIRequestInputTokens(body: Json): number {
   return 1 + Math.floor(prompt / 4);
 }
 
-/** Shared deterministic usage resolution for both client streaming formats. */
-function finalUsageValues(
+/** Resolve usage once for either streaming response format, preferring provider values. */
+function resolveFinalUsage(
   echoedOutput: string,
   fallbackInputTokens: number,
   upstreamInputTokens?: unknown,
@@ -327,21 +340,106 @@ function finalUsageValues(
   return { inputTokens, outputTokens, totalTokens };
 }
 
-/** Normalize a streamed OpenAI reply so the last data event always carries final usage before [DONE]. */
+// ---- Shared SSE framing, delta accumulation and response finalization ----
+/** Split complete SSE frames from a decoded chunk buffer; flush=true emits its final partial frame. */
+function parseSseFrames(buffer: string, flush = false): { frames: string[]; remaining: string } {
+  const frames: string[] = [];
+  let remaining = buffer;
+  let boundary = remaining.indexOf('\n\n');
+  while (boundary !== -1) {
+    frames.push(remaining.slice(0, boundary));
+    remaining = remaining.slice(boundary + 2);
+    boundary = remaining.indexOf('\n\n');
+  }
+  if (flush && remaining.trim() !== '') {
+    frames.push(remaining);
+    remaining = '';
+  }
+  return { frames, remaining };
+}
+
+/** Serialize one SSE event; rawData supports the OpenAI [DONE] sentinel without changing its bytes. */
+function serializeSseEvent(event: string | null, data: unknown, separator = '', rawData = false): string {
+  const eventLine = event === null ? '' : `event: ${event}\n`;
+  const payload = rawData ? String(data) : JSON.stringify(data);
+  return `${eventLine}data:${separator}${payload}\n\n`;
+}
+
+interface StreamDeltaAccumulator {
+  output: string;
+}
+
+/** Accumulate the exact text and tool-argument deltas used by deterministic fallback usage. */
+function accumulateStreamDelta(accumulator: StreamDeltaAccumulator, delta: Json): void {
+  if (typeof delta.content === 'string') accumulator.output += delta.content;
+  const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+  for (const call of calls) {
+    if (isRecord(call) && isRecord(call.function) && typeof call.function.arguments === 'string') {
+      accumulator.output += call.function.arguments;
+    }
+  }
+}
+
+type FinalizeOpenAIStream = {
+  clientWire: 'openai';
+  header: Json;
+  request: Json;
+  accumulator: StreamDeltaAccumulator;
+  upstreamUsage: Json | null;
+};
+
+type FinalizeAnthropicStream = {
+  clientWire: 'anthropic';
+  closeEvents: string[];
+  stopReason: string;
+  accumulator: StreamDeltaAccumulator;
+  fallbackInputTokens: number;
+  upstreamInputTokens: number | undefined;
+  upstreamOutputTokens: number | undefined;
+};
+
+/** Emit the protocol-specific terminal events after shared deterministic usage resolution. */
+function finalizeStreamResponse(state: FinalizeOpenAIStream | FinalizeAnthropicStream): string[] {
+  if (state.clientWire === 'openai') {
+    const upstream = state.upstreamUsage;
+    const usage = resolveFinalUsage(
+      state.accumulator.output,
+      openAIRequestInputTokens(state.request),
+      upstream?.prompt_tokens,
+      upstream?.completion_tokens,
+      upstream?.total_tokens,
+    );
+    const header = { ...state.header, choices: [], usage: { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens } };
+    return [serializeSseEvent(null, header, ' '), serializeSseEvent(null, '[DONE]', ' ', true)];
+  }
+  const usage = resolveFinalUsage(
+    state.accumulator.output,
+    state.fallbackInputTokens,
+    state.upstreamInputTokens,
+    state.upstreamOutputTokens,
+  );
+  return [
+    ...state.closeEvents,
+    serializeSseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: state.stopReason, stop_sequence: null }, usage: { output_tokens: usage.outputTokens } }),
+    serializeSseEvent('message_stop', { type: 'message_stop' }),
+  ];
+}
+
+/** Normalize an OpenAI stream to one final usage chunk followed by exactly one [DONE]. */
 export async function* openAIStreamWithFinalUsage(upstream: ReadableStream<Uint8Array>, request: Json): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let header: Json = { id: 'chatcmpl_aggregate', object: 'chat.completion.chunk', created: FIXED_OPENAI_CREATED, model: request.model ?? '' };
-  let usage: Json | null = null;
-  let output = '';
-  let sawDone = false;
+  let upstreamUsage: Json | null = null;
+  const accumulator: StreamDeltaAccumulator = { output: '' };
   const frames: string[] = [];
-  const consume = (frame: string): string | null => {
+
+  const consumeFrame = (frame: string): string | null => {
     let data = '';
     for (const line of frame.split('\n')) if (line.startsWith('data:')) data += `${data === '' ? '' : '\n'}${line.slice(5).trimStart()}`;
     if (!data) return frame;
-    if (data.trim() === '[DONE]') { sawDone = true; return null; }
+    if (data.trim() === '[DONE]') return null;
     let parsed: unknown;
     try { parsed = JSON.parse(data); } catch { return frame; }
     if (!isRecord(parsed)) return frame;
@@ -349,45 +447,40 @@ export async function* openAIStreamWithFinalUsage(upstream: ReadableStream<Uint8
     if (typeof parsed.object === 'string') header = { ...header, object: parsed.object };
     if (typeof parsed.created === 'number') header = { ...header, created: parsed.created };
     if (typeof parsed.model === 'string') header = { ...header, model: parsed.model };
-    if (isRecord(parsed.usage)) { usage = parsed.usage; return null; }
+    if (isRecord(parsed.usage)) { upstreamUsage = parsed.usage; return null; }
     const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
     const choice = isRecord(choices[0]) ? choices[0] : {};
     const delta = isRecord(choice.delta) ? choice.delta : {};
-    if (typeof delta.content === 'string') output += delta.content;
-    const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-    for (const call of calls) if (isRecord(call) && isRecord(call.function) && typeof call.function.arguments === 'string') output += call.function.arguments;
+    accumulateStreamDelta(accumulator, delta);
     return frame;
   };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        const kept = consume(frame);
+      const parsed = parseSseFrames(buffer);
+      buffer = parsed.remaining;
+      for (const frame of parsed.frames) {
+        const kept = consumeFrame(frame);
         if (kept !== null) frames.push(`${kept}\n\n`);
-        at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      const kept = consume(buffer);
+    const parsed = parseSseFrames(buffer, true);
+    for (const frame of parsed.frames) {
+      const kept = consumeFrame(frame);
       if (kept !== null) frames.push(`${kept}\n\n`);
     }
   } finally { reader.releaseLock(); }
   for (const frame of frames) yield frame;
-  const usageValues = finalUsageValues(output, openAIRequestInputTokens(request), usage?.prompt_tokens, usage?.completion_tokens, usage?.total_tokens);
-  const finalUsage = { prompt_tokens: usageValues.inputTokens, completion_tokens: usageValues.outputTokens, total_tokens: usageValues.totalTokens };
-  yield `data: ${JSON.stringify({ ...header, choices: [], usage: finalUsage })}\n\n`;
-  yield 'data: [DONE]\n\n';
-  void sawDone;
+  yield* finalizeStreamResponse({ clientWire: 'openai', header, request, accumulator, upstreamUsage });
 }
 
-/** Gemini generateContent response translated to OpenAI Chat Completions. */
-export function geminiToOpenAI(body: Json, model: string): Json {
+// ---- Response mapping: Gemini generateContent -> OpenAI Chat Completions ----
+/** Translate a Gemini generateContent response to OpenAI Chat Completions. */
+export function geminiResponseToOpenAIChat(body: Json, model: string): Json {
   const candidates = Array.isArray(body.candidates) ? body.candidates : [];
   const candidate = isRecord(candidates[0]) ? candidates[0] : {};
   const content = isRecord(candidate.content) ? candidate.content : {};
@@ -401,12 +494,16 @@ export function geminiToOpenAI(body: Json, model: string): Json {
     usage: { prompt_tokens: numberOrZero(usage.promptTokenCount), completion_tokens: numberOrZero(usage.candidatesTokenCount), total_tokens: numberOrZero(usage.totalTokenCount) } };
 }
 
+/** Backward-compatible name retained for the entry's tests and consumers. */
+export const geminiToOpenAI = geminiResponseToOpenAIChat;
+
 function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-/** A Chat Completions answer as an Anthropic Messages object. */
-export function openAIToAnthropic(body: Json, model: string): Json {
+// ---- Response mapping: OpenAI Chat Completions -> Anthropic Messages ----
+/** Translate an OpenAI Chat Completions response to an Anthropic Messages response. */
+export function openAIResponseToAnthropicMessage(body: Json, model: string): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
   const message = isRecord(choice.message) ? choice.message : {};
@@ -437,9 +534,12 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   };
 }
 
+/** Backward-compatible name retained for the entry's tests and consumers. */
+export const openAIToAnthropic = openAIResponseToAnthropicMessage;
+
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
 export function sseEvent(event: string | null, data: unknown): string {
-  return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
+  return serializeSseEvent(event, data);
 }
 
 /**
@@ -461,7 +561,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   let inputTokens = fallbackInputTokens;
   let outputTokens = 0;
   let sawUsage = false;
-  let echoedOutput = '';
+  const accumulator: StreamDeltaAccumulator = { output: '' };
 
   const startEvents = (): string[] => {
     if (started) return [];
@@ -495,11 +595,15 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
   const finishEvents = (stopReason: string): string[] => {
     if (finished) return [];
     finished = true;
-    return [
-      ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: finalUsageValues(echoedOutput, inputTokens, sawUsage ? inputTokens : undefined, sawUsage ? outputTokens : undefined).outputTokens } }),
-      sseEvent('message_stop', { type: 'message_stop' }),
-    ];
+    return finalizeStreamResponse({
+      clientWire: 'anthropic',
+      closeEvents: closeEvents(),
+      stopReason,
+      accumulator,
+      fallbackInputTokens: fallbackInputTokens || inputTokens,
+      upstreamInputTokens: sawUsage ? inputTokens : undefined,
+      upstreamOutputTokens: sawUsage ? outputTokens : undefined,
+    });
   };
 
   /** One SSE frame's lines as Anthropic events, mutating the stream's state. */
@@ -529,9 +633,9 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       const choice = isRecord(choices[0]) ? choices[0] : null;
       if (choice === null) continue;
       const delta = isRecord(choice.delta) ? choice.delta : {};
+      accumulateStreamDelta(accumulator, delta);
       out.push(...startEvents());
       if (typeof delta.content === 'string' && delta.content !== '') {
-        echoedOutput += delta.content;
         if (textIndex === -1) {
           textIndex = nextIndex;
           nextIndex += 1;
@@ -568,7 +672,6 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
         }
         const fn = isRecord(call.function) ? call.function : {};
         if (typeof fn.arguments === 'string' && fn.arguments !== '') {
-          echoedOutput += fn.arguments;
           out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
         }
       }
@@ -584,16 +687,13 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
+      const parsed = parseSseFrames(buffer);
+      buffer = parsed.remaining;
+      for (const frame of parsed.frames) for (const event of eventsOfFrame(frame)) yield event;
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
+    const parsed = parseSseFrames(buffer, true);
+    for (const frame of parsed.frames) for (const event of eventsOfFrame(frame)) yield event;
   } finally {
     reader.releaseLock();
   }
