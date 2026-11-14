@@ -84,7 +84,7 @@ import {
   openAIStreamWithFinalUsage,
   type ServedModel,
 } from './lib/wire.ts';
-import { failoverCandidates, providerIsExhausted } from './lib/failover.ts';
+import { compareCandidateRanks, failoverCandidates, providerIsExhausted } from './lib/failover.ts';
 
 /** The wire protocol's version, in the register body. */
 const PROTOCOL_VERSION = 1;
@@ -157,7 +157,10 @@ function candidatesFor(requires: Requirement): Route[] {
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  out.sort((a, b) => b.rating - a.rating || a.probe.provider.id.localeCompare(b.probe.provider.id) || a.model.id.localeCompare(b.model.id));
+  out.sort((a, b) => compareCandidateRanks(
+    { providerId: a.probe.provider.id, modelId: a.model.id, ratingMilli: a.rating },
+    { providerId: b.probe.provider.id, modelId: b.model.id, ratingMilli: b.rating },
+  ));
   return out;
 }
 

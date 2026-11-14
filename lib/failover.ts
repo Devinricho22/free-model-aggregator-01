@@ -1,10 +1,26 @@
-/** Deterministic sequential failover. Retire a provider only after a definitive exhaustion signal. */
+/** Inputs used to rank legal model/provider routes before any upstream calls are made. */
+export interface CandidateRank {
+  providerId: string;
+  modelId: string;
+  ratingMilli: number;
+}
+
+/** Higher quality first, then stable provider/model names for deterministic ties. */
+export function compareCandidateRanks(a: CandidateRank, b: CandidateRank): number {
+  return b.ratingMilli - a.ratingMilli || a.providerId.localeCompare(b.providerId) || a.modelId.localeCompare(b.modelId);
+}
+
+/** One sequential provider attempt. A refusal can mark its provider permanently exhausted. */
 export interface CandidateAttempt<T> {
   ok: boolean;
   value?: T;
   retireProvider?: boolean;
 }
 
+/**
+ * Walk an already-ranked list exactly once, skipping only providers confirmed exhausted.
+ * Transient refusal classification belongs to the caller, which has the provider response body.
+ */
 export async function failoverCandidates<C, T>(
   candidates: readonly C[],
   retiredProviders: Set<string>,
@@ -21,7 +37,7 @@ export async function failoverCandidates<C, T>(
   return null;
 }
 
-/** Failure text from provider error envelopes; scheduled rate limits are intentionally transient. */
+/** Refusal classification: scheduled failures/concurrency move on; confirmed depletion retires. */
 export function providerIsExhausted(status: number, body: unknown): boolean {
   let message = '';
   if (body !== null && typeof body === 'object') {

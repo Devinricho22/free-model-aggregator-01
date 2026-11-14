@@ -313,6 +313,20 @@ export function openAIRequestInputTokens(body: Json): number {
   return 1 + Math.floor(prompt / 4);
 }
 
+/** Shared deterministic usage resolution for both client streaming formats. */
+function finalUsageValues(
+  echoedOutput: string,
+  fallbackInputTokens: number,
+  upstreamInputTokens?: unknown,
+  upstreamOutputTokens?: unknown,
+  upstreamTotalTokens?: unknown,
+): { inputTokens: number; outputTokens: number; totalTokens: number } {
+  const inputTokens = typeof upstreamInputTokens === 'number' ? upstreamInputTokens : fallbackInputTokens;
+  const outputTokens = typeof upstreamOutputTokens === 'number' ? upstreamOutputTokens : 1 + Math.floor(echoedOutput.length / 4);
+  const totalTokens = typeof upstreamTotalTokens === 'number' ? upstreamTotalTokens : inputTokens + outputTokens;
+  return { inputTokens, outputTokens, totalTokens };
+}
+
 /** Normalize a streamed OpenAI reply so the last data event always carries final usage before [DONE]. */
 export async function* openAIStreamWithFinalUsage(upstream: ReadableStream<Uint8Array>, request: Json): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -365,9 +379,8 @@ export async function* openAIStreamWithFinalUsage(upstream: ReadableStream<Uint8
     }
   } finally { reader.releaseLock(); }
   for (const frame of frames) yield frame;
-  const inputTokens = typeof usage?.prompt_tokens === 'number' ? usage.prompt_tokens : openAIRequestInputTokens(request);
-  const outputTokens = typeof usage?.completion_tokens === 'number' ? usage.completion_tokens : 1 + Math.floor(output.length / 4);
-  const finalUsage = { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: typeof usage?.total_tokens === 'number' ? usage.total_tokens : inputTokens + outputTokens };
+  const usageValues = finalUsageValues(output, openAIRequestInputTokens(request), usage?.prompt_tokens, usage?.completion_tokens, usage?.total_tokens);
+  const finalUsage = { prompt_tokens: usageValues.inputTokens, completion_tokens: usageValues.outputTokens, total_tokens: usageValues.totalTokens };
   yield `data: ${JSON.stringify({ ...header, choices: [], usage: finalUsage })}\n\n`;
   yield 'data: [DONE]\n\n';
   void sawDone;
@@ -484,7 +497,7 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     finished = true;
     return [
       ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: sawUsage ? outputTokens : 1 + Math.floor(echoedOutput.length / 4) } }),
+      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: finalUsageValues(echoedOutput, inputTokens, sawUsage ? inputTokens : undefined, sawUsage ? outputTokens : undefined).outputTokens } }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
   };
